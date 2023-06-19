@@ -1,0 +1,7 @@
+--find-links https://download.pytorch.org/whl/torch
+hydra-core==1.3.2
+transformers==4.28.0
+torch==1.13.1+cpu
+cpm-kernels==1.0.11
+sentencepiece==0.1.99
+https://github.com/graphcore/PopRT/releases/download/v1.1.0/poprt-1.1.0.ubuntu.2004-cp38-cp38-linux_x86_64.whl
