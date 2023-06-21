@@ -1,10 +1,10 @@
 # PopTransformer
-The repository provides a fundamental framework(including layers, operators, models, etc) that allow users to develop and run highly optimized transformer-based models(inference-only) with [Poplar SDK](https://docs.graphcore.ai/en/latest/software.html) on [Graphcore IPU](https://www.graphcore.ai/). Currently we provide examples like GPT2 and ChatGLM, and more LLM models will be supported in the future.
+The repository provides a fundamental framework(including layers, operators, models, etc) that allow users to develop and run highly optimized transformer-based models(inference-only) with [Poplar SDK](https://docs.graphcore.ai/en/latest/software.html) on [Graphcore IPU](https://www.graphcore.ai/). Currently, we provide examples like GPT2 and ChatGLM, and more LLM models will be supported in the future.
 
 ## Install
 
-Follow below steps to setup develop environment on C600:
-1. (Optional) Create python virtual env
+Follow the below steps to setup the development environment on C600:
+1. (Optional) Create Python virtual env
 2. Enable Poplar SDK(all models are tested with SDK `3.2.0`)
 ```
 source [path-to-sdk]/enable.sh
@@ -12,7 +12,7 @@ source [path-to-sdk]/enable.sh
 3. Run `make` to compile custom ops
 4. Run `pip install -r requirements.txt`
 
-If you are using M2000 or BOW-M2000, we provide a script to run in docker container by:
+If you are using M2000 or BOW-M2000, we provide a script to run in a docker container by:
 ```
 bash docker/setup_container.sh
 ```
@@ -100,7 +100,7 @@ class GPTDecModel(HFDecBaseModel):
 ```
 
 4. Test and run
-If you have done all above and tests, you can simply run from the entry files `examples/your_model/inference.py` by:
+If you have done all the above and the tests, you can simply run from the entry files `examples/your_model/inference.py` by:
 ```
 cd examples/your_model
 python inference.py
