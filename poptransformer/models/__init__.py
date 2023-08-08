@@ -14,3 +14,6 @@
 from .base_model import HFDecBaseModel, HFDec2stageBaseModel
 from .gpt2.model import GPT2DecModel
 from .chatglm.model import ChatGLMDecModel
+from .rwkv.model import RWKVDecodeModel
+from .chatglm2.model import ChatGLM2DecModel
+from .llama2.model import LLAMA2DecModel

@@ -12,6 +12,8 @@
 # limitations under the License.
 
 import numpy as np
+from poptransformer.ops.customized import int4_to_half
+from poptransformer.utils.registry import REGISTRY
 
 
 def pad(graph, x, pad_list, mode='constant', constant_value=0.0):
@@ -50,14 +52,18 @@ def sub(graph, x, y):
 def div(graph, x, y):
     return graph.aiOnnx.div([x, y])
 
-def matmul(graph, x, y, amp=None, partialtype=None, serial_factor=None):
+def matmul(graph, x, y):
     o = graph.aiOnnx.matmul([x, y])
-    if serial_factor:
-        graph.setSerializeMatMul({o}, mode="input_channels", factor=serial_factor)
-    if amp:
+    amp = REGISTRY.get('amp')
+    partialtype = REGISTRY.get('partialtype')
+    serial_factor = REGISTRY.get('serial_factor')
+    serial_mode = REGISTRY.get('serial_mode')
+    if amp is not None:
         graph.setAvailableMemoryProportion(o, amp)
-    if partialtype:
+    if partialtype is not None:
         graph.setPartialsType(o, partialtype)
+    if serial_factor is not None:
+        graph.setSerializeMatMul({o}, mode=serial_mode, factor=serial_factor)
     return o
 
 def constant(graph, tensor, tensor_name='constant'):
@@ -173,3 +179,53 @@ def loop(graph, max_loop_num, loop_graph_input_list, loop_graph):
 
 def call_sub_graph(graph, input_list, sub_graph):
     return graph.aiGraphcore.call(input_list, 1, sub_graph)
+
+def replicated_all_reduce(graph, x):
+    return graph.aiGraphcore.replicatedallreduce([x])
+
+def conv(graph, x, weight, bias, kernel_shape, strides, pads, dilations, group):
+    args = [x, weight] if bias is None else [x, weight, bias]
+    o = graph.aiOnnx.conv(
+        args=args,
+        kernel_shape=kernel_shape,
+        strides=strides,
+        pads=pads,
+        dilations=dilations,
+        group=group
+    )
+    amp = REGISTRY.get('amp')
+    partialtype = REGISTRY.get('partialtype')
+    if amp is not None:
+        graph.setAvailableMemoryProportion(o, amp)
+    if partialtype is not None:
+        graph.setPartialsType(o, partialtype)
+    return o
+
+def relu(graph, x):
+    return graph.aiOnnx.relu([x])
+
+def sigmoid(graph, x):
+    return graph.aiOnnx.sigmoid([x])
+
+def exp(graph, x):
+    return graph.aiOnnx.exp([x])
+
+def maximum(graph, x, y):
+    cond = greater(graph, x, y)
+    output = where(graph, cond, x, y)
+    return output
+
+def swish(graph, x):
+    return graph.aiGraphcore.swish([x])
+
+def mean(graph, x):
+    return graph.aiOnnx.mean([x])
+
+def sqrt(graph, x):
+    return graph.aiOnnx.sqrt([x])
+
+def reciprocal(graph, x):
+    return graph.aiOnnx.reciprocal([x])
+
+def reducemean(graph, x):
+    return graph.aiOnnx.reducemean([x],axes=[-1])

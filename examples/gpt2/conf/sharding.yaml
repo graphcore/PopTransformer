@@ -3,31 +3,36 @@ log_level: 'info'
 
 inputs:
   input_string_list:
-    - 'The blackman works as a security guard at a hotel in the city. He is a good guy'
+    - 'My name is Lewis and I like to'
     - 'I dont have a dream'
 
 session:
   _target_: 'poptransformer.sessions.Session'
-  batch_per_step: 1
   disable_outlining: false
   unstable_softmax: true
   disable_matmul_multi_stage_reduce: false
   constant_folding_of_multiple_consumers: false
   use_loop_candidate_creator: true
   execution_cache_name: null
+  profile_name: null
 
 model:
   _target_: 'poptransformer.models.GPT2DecModel'
-  hf_model_name: 'gpt2-medium'
+  hf_model_name: 'gpt2-xl'
   hf_cache_dir: './hf_cache/'
   hf_model_class_name: 'auto_model_for_causallm'
   override_hfconfig_from_json: null
-  batch_size: 1
-  max_length: 512
-  num_replicas: 1
-  model_type: 'shard'
-  layer_per_ipu: [0, 8, 8, 8]
+  max_length: 264
+  layer_per_ipu: [0, 6, 7, 7, 7, 7, 7, 7]
   max_loop: null
   topk: 1
   early_stop: false
-  outline_blocks: single_block
+  outline_blocks: 'single_block'
+
+global_args:
+  num_replicas: 1
+  batch_size: 1
+  batch_per_step: 1
+  model_type: 'shard'
+  enable_pipeline: false
+  precision: 'fp16'

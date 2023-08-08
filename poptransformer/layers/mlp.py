@@ -12,7 +12,6 @@
 # limitations under the License.
 
 from poptransformer import ops
-from poptransformer.utils import shard, repeat
 from .base_layer import BaseLayer
 from .linear import Linear
 
@@ -35,9 +34,9 @@ class BaseMLP(BaseLayer):
     def __call__(self, graph, x):
         with graph.nameScope(self.context):
             x = ops.reshape(graph, x, [-1, self.input_size])
-            x = self.c_fc(graph, x, **self.matmul_kwargs)
+            x = self.c_fc(graph, x)
             x = self.act_fn(graph, x)
-            x = self.c_proj(graph, x, **self.matmul_kwargs)
+            x = self.c_proj(graph, x)
             x = ops.reshape(graph, x, [self.batch_size, -1, self.input_size])
             return x
 
@@ -45,36 +44,14 @@ class BaseMLP(BaseLayer):
 class TPMLP(BaseMLP):
 
     def collect_bind_layer_weights(self):
-        vs_setting = {'vs_type': 'consecutive', 'group_size': 1}
-        c_fc_weight_key = '.'.join([self.context, 'c_fc.weight'])
-        c_fc_weight_np = self.get_param_from_state_dict(c_fc_weight_key, [self.input_size, self.hidden_size])
-        c_fc_bias_key = '.'.join([self.context, 'c_fc.bias'])
-        c_fc_bias_np = self.get_param_from_state_dict(c_fc_bias_key, [self.hidden_size])
-        c_fc_weight_np = shard(c_fc_weight_np, self.num_replicas, axis=-1)
-        c_fc_bias_np = shard(c_fc_bias_np, self.num_replicas, axis=-1)
-        self.c_fc_weight_id = self.add_initialized_input_tensor(c_fc_weight_np, c_fc_weight_key, **vs_setting)
-        self.c_fc_bias_id = self.add_initialized_input_tensor(c_fc_bias_np, c_fc_bias_key, **vs_setting)
-
-        c_proj_weight_key = '.'.join([self.context, 'c_proj.weight'])
-        c_proj_weight_np = self.get_param_from_state_dict(c_proj_weight_key, [self.hidden_size, self.input_size])
-        c_proj_bias_key = '.'.join([self.context, 'c_proj.bias'])
-        c_proj_bias_np = self.get_param_from_state_dict(c_proj_bias_key, [self.input_size])
-        c_proj_weight_np = shard(c_proj_weight_np, self.num_replicas, axis=0)
-        c_proj_bias_np = repeat(c_proj_bias_np, self.num_replicas, axis=0)
-        self.c_proj_weight_id = self.add_initialized_input_tensor(c_proj_weight_np, c_proj_weight_key, **vs_setting)
-        self.c_proj_bias_id = self.add_initialized_input_tensor(c_proj_bias_np, c_proj_bias_key, **vs_setting)
-
-    def __call__(self, graph, x):
-        with graph.nameScope(self.context):
-            x = ops.reshape(graph, x, [-1, self.input_size])
-            x = ops.matmul(graph, x, self.c_fc_weight_id)
-            x = ops.add(graph, x, self.c_fc_bias_id)
-            x = self.act_fn(graph, x)
-            x = ops.matmul(graph, x, self.c_proj_weight_id)
-            x = graph.aiGraphcore.replicatedallreduce([x])
-            x = ops.add(graph, x, self.c_proj_bias_id)
-            x = ops.reshape(graph, x, [self.batch_size, -1, self.input_size])
-            return x
+        fc_tp_setting = {
+            'strategy_name': 'start',
+        }
+        self.c_fc = Linear(self.context, 'c_fc', self.input_size, self.hidden_size, **fc_tp_setting)
+        proj_tp_setting = {
+            'strategy_name': 'end',
+        }
+        self.c_proj = Linear(self.context, 'c_proj', self.hidden_size, self.input_size, **proj_tp_setting)
 
 
 class MLP(TPMLP, BaseMLP):
@@ -90,8 +67,7 @@ class MLP(TPMLP, BaseMLP):
         self.logger.debug(f'initializing model type: {self.layer_class.__name__}')
         super().__init__(context, name, input_size, hidden_size, act_fn)
 
-    def __call__(self, graph, x, **matmul_kwargs):
-        self.matmul_kwargs = matmul_kwargs
+    def __call__(self, graph, x):
         return self.layer_class.__call__(self, graph, x)
 
     def collect_bind_layer_weights(self):

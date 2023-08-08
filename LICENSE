@@ -1,3 +1,4 @@
+   The content of this repository is licensed under the Apache License, Version 2.0 (below) except for the model code for Llama 2 (in poptransformer/models/llama2) which is licensed under the Llama 2 Community License Agreement (see poptransformer/models/llama2/LICENSE).
 
                                  Apache License
                            Version 2.0, January 2004

@@ -12,8 +12,10 @@
 # limitations under the License.
 
 from .base_layer import BaseLayer
+from .lm_head import LMHead
 from .linear import Linear
 from .mlp import MLP
 from .embedding import Embedding
 from .layer_norm import LayerNorm
-from .lm_head import LMHead
+from .conv import Conv2d
+from .conv import Conv1d

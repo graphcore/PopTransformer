@@ -12,33 +12,12 @@
 # limitations under the License.
 
 import time
-import logging
 import sys
 import os
-import popart
 import hydra
-from hydra.utils import instantiate
-
 sys.path.append("../../")
 os.environ["HYDRA_FULL_ERROR"] = "1"
-from poptransformer.utils import REGISTRY
-
-
-def register_config_logger(config):
-    popart.getLogger().setLevel(config.popart_log_level.upper())
-    logger = logging.getLogger("poptransformer")
-    logger.setLevel(config.log_level.upper())
-    REGISTRY.register("logger", logger)
-
-
-def prepare(config):
-    register_config_logger(config)
-    model = instantiate(config.model)
-    session = instantiate(config.session)
-    model.build_graph()
-    model.graph.saveInitializersExternally(model.initializers, "saved_initializer.onnx")
-    session.compile(model)
-    return session, model
+from poptransformer.utils import prepare_model_session
 
 
 def run_inference(session, model, *args, **kwargs):
@@ -54,13 +33,13 @@ def run_inference(session, model, *args, **kwargs):
         all_time.append(end - start)
 
     output = model.build_output_dict(session.anchor_arrays)
+    model.logger.info(output)
     decode_step = output["decode_step"].item()
     num_output_tokens = decode_step - model.input_length
     latency = sum(all_time) / len(all_time)
     latency_per_token = latency / decode_step
     latency_per_output_token = latency / num_output_tokens
     throughput = int(model.batch_size * num_output_tokens / latency)
-    model.logger.info(output)
     performance = (
         "\nPerformance: \n"
         + f"batch size: {model.batch_size}, precision: {model.precision}\n"
@@ -71,13 +50,10 @@ def run_inference(session, model, *args, **kwargs):
     )
     model.logger.info(performance)
 
-
 @hydra.main(version_base=None, config_path="conf", config_name="sharding")
 def main(config):
-    print(config)
-    session, model = prepare(config)
+    session, model = prepare_model_session(config)
     run_inference(session, model, **config.inputs)
-
 
 if __name__ == "__main__":
     main()

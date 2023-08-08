@@ -17,5 +17,6 @@ wiki*
 *.pop_cache
 *.log
 *.popef
-profile*
-popef_cache_dir*
+profiles/
+popef_cache_dir/
+.vscode/

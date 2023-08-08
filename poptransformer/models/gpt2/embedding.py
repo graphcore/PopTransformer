@@ -38,10 +38,6 @@ class BaseTransformerEmbedding(BaseLayer):
 
 class TPTransformerEmbedding(BaseTransformerEmbedding):
 
-    def collect_bind_layer_weights(self):
-        self.wte = Embedding(self.context, 'wte', self.vocab_size, self.embd_size)
-        self.wpe = Embedding(self.context, 'wpe', self.max_position, self.embd_size)
-
     def __call__(self, graph, input_ids, position_ids, sequence_length):
         with graph.nameScope(self.context):
             input_embeds = self.wte(graph, input_ids, sequence_length)

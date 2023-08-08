@@ -27,11 +27,9 @@ class BaseEmbedding(BaseLayer):
         self.collect_bind_layer_weights()
 
     def collect_bind_layer_weights(self):
-        index_offset = np.expand_dims(np.arange(1, dtype=np.int32), [1, 2]) * math.ceil(self.vocab_size)
-        self.index_offset = self.add_initialized_input_tensor(index_offset, 'index_offset')
-
         weight_key = '.'.join([self.context, 'weight'])
-        self.weight_id = self.get_add_param_from_state_dict(weight_key, [self.vocab_size, self.embed_size])
+        weight_np = self.get_param_from_state_dict(weight_key, [self.vocab_size, self.embed_size])
+        self.weight_id = self.add_initialized_input_tensor(weight_np, weight_key)
 
     def __call__(self, graph, input_ids, sequence_length):
         with graph.nameScope(self.context):
@@ -66,7 +64,6 @@ class TPEmbedding(BaseEmbedding):
             updated_replicated_input_ids = ops.where(graph, cond, fill_value, replicated_input_ids)
             output = ops.gather(graph, self.weight_id, updated_replicated_input_ids)
             return output
-
 
 
 class Embedding(TPEmbedding, BaseEmbedding):

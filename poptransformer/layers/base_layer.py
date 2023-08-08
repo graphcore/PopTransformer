@@ -14,7 +14,7 @@
 from abc import abstractmethod
 import numpy as np
 from popart import VariableRetrievalMode, VariableSettings, CommGroupType, CommGroup
-from poptransformer.utils import REGISTRY
+from poptransformer.utils import REGISTRY, DeviceScope, OptionsScope
 
 
 class BaseLayer:
@@ -37,6 +37,10 @@ class BaseLayer:
         return REGISTRY.get('model_type')
 
     @property
+    def batch_per_step(self):
+        return REGISTRY.get('batch_per_step')
+
+    @property
     def batch_size(self):
         return REGISTRY.get('batch_size')
 
@@ -54,15 +58,25 @@ class BaseLayer:
 
     @property
     def popart_float_type(self):
-        return REGISTRY.get('popart_float_type')
+        return REGISTRY.get('tensor_type').popart_float_type
 
     @property
     def np_float_type(self):
-        return REGISTRY.get('np_float_type')
+        return REGISTRY.get('tensor_type').np_float_type
 
     @property
     def precision(self):
-        return REGISTRY.get('precision')
+        return REGISTRY.get('tensor_type').precision
+
+    @property
+    def enable_pipeline(self):
+        return REGISTRY.get('enable_pipeline')
+
+    def option_scope(self, amp=None, partialtype=None, serial_factor=None, serial_mode=None):
+        return OptionsScope(amp, partialtype, serial_factor, serial_mode)
+
+    def device_scope(self, graph, virtual_graph_id=None, pipeline_stage_id=None, outline_attr=None):
+        return DeviceScope(graph, virtual_graph_id, pipeline_stage_id, self.enable_pipeline, outline_attr)
 
     @abstractmethod
     def __call__(self, graph, *args):
@@ -82,12 +96,13 @@ class BaseLayer:
         assert retrieval_mode, f"Invalid retrieval_mode: {retrieval_mode}"
         variableSettings = VariableSettings(
             CommGroup(vs_type, replicaGroupSize=group_size),
-            retrieval_mode)
+            retrieval_mode
+        )
         return variableSettings
 
-    def add_initialized_input_tensor(self, weight_np, weight_key, **vs_setting_kwargs):
-        if vs_setting_kwargs:
-            variable_setting = self.build_variable_setting(**vs_setting_kwargs)
+    def add_initialized_input_tensor(self, weight_np, weight_key, **variable_setting):
+        if variable_setting:
+            variable_setting = self.build_variable_setting(**variable_setting)
             weight_id = self.main_graph.addInitializedInputTensor(weight_np, variable_setting, weight_key)
         else:
             weight_id = self.main_graph.addInitializedInputTensor(weight_np, debugContext=weight_key)
@@ -95,23 +110,19 @@ class BaseLayer:
 
     def get_param_from_state_dict(self, weight_key, shape_list):
         weight_np = self.state_dict.get(weight_key, None)
+
         if weight_np is None:
-            self.logger.debug(f'{weight_key} not found, using random tensor')
-            assert shape_list, f'  no shape provided for random initializing the tensor {weight_key}'
+            self.logger.info(f'{weight_key} not found, using random tensor')
+            assert shape_list, f'no shape provided for random initializing the tensor {weight_key}'
             weight_np = np.random.randn(*shape_list).astype(dtype=self.np_float_type)
         else:
             weight_np = weight_np.numpy()
             if shape_list:
-                assert sum(
-                    (abs(a - b) for a, b in zip(weight_np.shape, shape_list))
-                    ) == 0, f'{weight_key} shape {weight_np.shape} not matched with provided {shape_list}'
+                self.logger.info(f"loading {weight_key} with shape {weight_np.shape}, dtype {weight_np.dtype}.")
+                if self.precision not in ['int4', 'fp8', 'fp8_weight']:
+                    assert sum(
+                        (abs(a - b) for a, b in zip(weight_np.shape, shape_list))
+                        ) == 0, f'{weight_key} shape {weight_np.shape} not matched with provided {shape_list}'
             else:
-                self.logger.warning(f'shape_list not provided, skip shape check for {weight_key}')
-            self.logger.debug(f'  using param {weight_key} from state_dict')
-
+                self.logger.warning(f'shape not provided or using int4/fp8 weight, skip shape check for {weight_key}')
         return weight_np
-
-    def get_add_param_from_state_dict(self, weight_key, shape_list, **vs_setting_kwargs):
-        weight_np = self.get_param_from_state_dict(weight_key, shape_list)
-        weight_id = self.add_initialized_input_tensor(weight_np, weight_key, **vs_setting_kwargs)
-        return weight_id

@@ -14,7 +14,6 @@
 import ctypes
 import numpy as np
 import poprt
-
 so_path = '../../custom_ops.so'
 ctypes.cdll.LoadLibrary(so_path)
 
@@ -30,7 +29,7 @@ def kv_cache(graph, step, updater, max_len, sequence_axis=1, step_len=1):
             'max_len': max_len,
             'step_len':  step_len,
             'sequence_axis': sequence_axis,
-            'fp8': False
+            'fp8': False,
         },
     )[0]
     return output
@@ -110,4 +109,40 @@ def replicated_allgather(graph, matmul_output):
         domain="ai.graphcore",
         inputs=[matmul_output],
         attributes={})[0]  # shape is 1 dim
+    return output
+
+
+def int4_to_half(graph, x, scale, ref, axis=1, remap=1):
+    x = graph.customOp(
+            inputs=[x, scale, ref],
+            opName="Int4ToHalf",
+            domain="ai.graphcore",
+            opVersion=1,
+            attributes={
+                "axis": axis,
+                "remap": remap},
+        )[0]
+    return x
+
+def half_to_uint8(graph, x, fp8_scale, fp8_format='F143'):
+    output = graph.customOp(
+        opName="CastToUint8WithoutShapeInfer",
+        opVersion=1,
+        domain="ai.graphcore",
+        inputs=[x, fp8_scale],
+        attributes={"fp8Format": fp8_format},
+    )[0]
+    return output
+
+def fp8_matmul(graph, input_l, input_r, fp8_scale_lhs, fp8_scale_rhs, fp8_format_lhs='F143', fp8_format_rhs='F143'):
+    output = graph.customOp(
+        opName="FP8MatMulWithoutShapeInfer",
+        opVersion=1,
+        domain="ai.graphcore",
+        inputs=[input_l, input_r, fp8_scale_lhs, fp8_scale_rhs],
+        attributes={
+            "fp8FormatLHS": fp8_format_lhs,
+            "fp8FormatRHS": fp8_format_rhs,
+        },
+    )[0]
     return output

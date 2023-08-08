@@ -22,13 +22,15 @@ class Session:
 
     def __init__(self, **kwargs):
         self.logger.info(f'initializing {self.__class__.__name__}')
-        self.batch_per_step = kwargs.get('batch_per_step', 1)
         self.execution_cache_name = kwargs.get('execution_cache_name', None)
         self.disable_outlining = kwargs.get('disable_outlining', False)
         self.unstable_softmax = kwargs.get('unstable_softmax', False)
         self.disable_matmul_multi_stage_reduce = kwargs.get('disable_matmul_multi_stage_reduce', False)
         self.constant_folding_of_multiple_consumers = kwargs.get('constant_folding_of_multiple_consumers', False)
         self.use_loop_candidate_creator = kwargs.get('use_loop_candidate_creator', True)
+        self.profile_name = kwargs.get('profile_name', None)
+        self.enable_pipeline = REGISTRY.get('enable_pipeline')
+        self.batch_per_step = REGISTRY.get('batch_per_step')
 
     def compile(self, model):
         self.model = model
@@ -47,7 +49,7 @@ class Session:
         self.session.run(stepio)
 
     def _build_data_flow(self):
-        self.logger.info('building data flow')
+        self.logger.info(f'building data flow, with batch_per_step: {self.batch_per_step}.')
         self.data_flow = popart.DataFlow(self.batch_per_step, self.model.model_output)
 
     def _build_device_info(self):
@@ -66,13 +68,25 @@ class Session:
         self.options.replicatedGraphCount = self.model.num_replicas
         self.options.enableConstantFoldingOfMultipleConsumers = self.constant_folding_of_multiple_consumers
         self.options.useLoopCandidateCreator = self.use_loop_candidate_creator
+        self.options.enablePipelining = self.enable_pipeline
+
         if self.disable_matmul_multi_stage_reduce:
             self.options.matmulOptions = {"enableMultiStageReduce": "false"}
         if self.model.stage_num != 1:
             self.options.virtualGraphMode = popart.VirtualGraphMode.Manual
+            self.logger.info('setting virtual graph model to manual')
         if self.execution_cache_name:
             self.options.enableEngineCaching = True
             self.options.cachePath = self.execution_cache_name
+            self.logger.info(f'saving execution cache in {self.execution_cache_name}')
+        if self.profile_name:
+            self.options.engineOptions = {
+                "autoReport.all": "true",
+                "autoReport.directory": f'profiles/{self.profile_name}',
+                "autoReport.executionProfileProgramRunCount":"2",
+                "debug.allowOutOfMemory": "true"
+            }
+            self.logger.info(f'saving profiles in profiles/{self.profile_name}')
 
     def _build_inference_session(self):
         self.logger.info('building inference session')

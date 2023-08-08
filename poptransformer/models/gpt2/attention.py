@@ -12,7 +12,6 @@
 # limitations under the License.
 
 from poptransformer import ops
-from poptransformer.utils import shard, repeat, shard_fused_qkv
 from poptransformer.layers import BaseLayer
 from poptransformer.layers import Linear
 
@@ -89,68 +88,12 @@ class BaseAttention(BaseLayer):
 class TPAttention(BaseAttention):
 
     def collect_bind_layer_weights(self):
-        self.sharded_embd = self.input_size // self.num_replicas
-        self.sharded_head = self.num_head // self.num_replicas
-        vs_setting = {'vs_type': 'consecutive', 'group_size': 1}
-
-        c_attn_weight_key = '.'.join([self.context, 'c_attn.weight'])
-        c_attn_weight_np = self.get_param_from_state_dict(c_attn_weight_key, [self.input_size, self.input_size * 3])
-        c_attn_bias_key = '.'.join([self.context, 'c_attn.bias'])
-        c_attn_bias_np = self.get_param_from_state_dict(c_attn_bias_key, [self.input_size * 3])
-        c_attn_weight_np = shard_fused_qkv(c_attn_weight_np, self.num_replicas)
-        c_attn_bias_np = shard_fused_qkv(c_attn_bias_np, self.num_replicas)
-        self.c_attn_weight_id = self.add_initialized_input_tensor(c_attn_weight_np, c_attn_weight_key, **vs_setting)
-        self.c_attn_bias_id = self.add_initialized_input_tensor(c_attn_bias_np, c_attn_bias_key, **vs_setting)
-
-        c_proj_weight_key = '.'.join([self.context, 'c_proj.weight'])
-        c_proj_weight_np = self.get_param_from_state_dict(c_proj_weight_key, [self.input_size, self.input_size])
-        c_proj_bias_key = '.'.join([self.context, 'c_proj.bias'])
-        c_proj_bias_np = self.get_param_from_state_dict(c_proj_bias_key, [self.input_size])
-        c_proj_weight_np = shard(c_proj_weight_np, self.num_replicas, axis=0)
-        c_proj_bias_np = repeat(c_proj_bias_np, self.num_replicas, axis=0)
-        self.c_proj_weight_id = self.add_initialized_input_tensor(c_proj_weight_np, c_proj_weight_key, **vs_setting)
-        self.c_proj_bias_id = self.add_initialized_input_tensor(c_proj_bias_np, c_proj_bias_key, **vs_setting)
-
-    def forward_qkv(self, graph, x, step):
-        x = ops.reshape(graph, x, [self.batch_size * self.sequence_length, self.input_size])
-        qkv = ops.matmul(graph, x, self.c_attn_weight_id)
-        qkv = ops.add(graph, qkv, self.c_attn_bias_id)
-        q, k, v = ops.split(
-            graph, qkv, num_outputs=3, axis=-1, splits=[self.sharded_embd] * 3, name='split_qkv')
-
-        q = ops.reshape(graph, q, [self.batch_size, self.sequence_length, self.sharded_head, self.head_size])
-        q = ops.transpose(graph, q, [0, 2, 1, 3])  # q: [B, N, L, h]
-        v = ops.reshape(graph, v, [self.batch_size, self.sequence_length, self.sharded_head, self.head_size])
-        v = ops.transpose(graph, v, [0, 2, 1, 3])  # v: [B, N, L, h]
-        k = ops.reshape(graph, k, [self.batch_size, self.sequence_length, self.sharded_head, self.head_size])
-        k = ops.transpose(graph, k, [0, 2, 3, 1])  # k: [B, N, h, L]
-
-        if self.sequence_length == 1:
-            k = ops.kv_cache(graph, step, k, self.cache_max_length, 3, self.sequence_length)
-            v = ops.kv_cache(graph, step, v, self.cache_max_length, 2, self.sequence_length)
-            k = ops.remap_tensor(graph, k)
-            v = ops.remap_tensor(graph, v)
-        return q, k, v
-
-    def forward_attention(self, graph, q, k, attention_mask, softmax_type):
-        score = ops.matmul(graph, q, k)
-        if self.sequence_length != 1:
-            score = ops.remap_tensor(graph, score, fwd_after_matmul=True)
-        score = ops.add(graph, score, attention_mask)
-        softmax_fn = self.softmax_fn_map.get(softmax_type, None)
-        if not softmax_fn:
-            raise ValueError(f"Invalid softmax_fn {softmax_type}, options: {self.softmax_fn_map.keys()}")
-        score = softmax_fn(graph, score, -1, stable_mode=self.sequence_length != 1)
-        return score
-
-    def forward_output(self, graph, score, v):
-        score = ops.matmul(graph, score, v)
-        score = ops.transpose(graph, score, [0, 2, 1, 3])
-        score = ops.reshape(graph, score, [self.batch_size, self.sequence_length, self.sharded_embd])
-        output = ops.matmul(graph, score, self.c_proj_weight_id)
-        output = graph.aiGraphcore.replicatedallreduce([output])
-        output = ops.add(graph, output, self.c_proj_bias_id)
-        return output
+        qkv_tp_setting = {'strategy_name': 'fused_qkv'}
+        self.c_attn = Linear(self.context, 'c_attn', self.input_size, self.input_size * 3, **qkv_tp_setting)
+        proj_tp_setting = {'strategy_name': 'end'}
+        self.c_proj = Linear(self.context, 'c_proj', self.input_size, self.input_size, **proj_tp_setting)
+        self.input_size = self.input_size // self.num_replicas
+        self.num_head = self.num_head // self.num_replicas
 
 
 class Attention(TPAttention, BaseAttention):

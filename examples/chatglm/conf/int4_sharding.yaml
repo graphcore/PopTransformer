@@ -1,0 +1,40 @@
+popart_log_level: 'off'
+log_level: 'info'
+
+inputs:
+  input_string: '晚上睡不着怎么办'
+  use_history: False
+
+session:
+  _target_: 'poptransformer.sessions.Session'
+  disable_outlining: true
+  unstable_softmax: false
+  disable_matmul_multi_stage_reduce: false
+  constant_folding_of_multiple_consumers: false
+  use_loop_candidate_creator: true
+  execution_cache_name: './popef_cache_dir'
+  profile_name: null
+
+model:
+  _target_: 'poptransformer.models.ChatGLMDecModel'
+  hf_model_name: 'THUDM/chatglm-6b-int4'
+  hf_cache_dir: './hf_cache/'
+  hf_model_class_name: 'auto_model'
+  override_hfconfig_from_json: null
+
+  input_length: 256
+  max_length: 512
+  layer_per_ipu: [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+  max_loop: null
+  topk: 1
+  early_stop: true
+  outline_blocks: 'single_block'
+  num_embedding_partitions: 2
+
+global_args:
+  num_replicas: 1
+  batch_size: 1
+  batch_per_step: 1
+  model_type: 'shard'
+  enable_pipeline: false
+  precision: 'int4'

@@ -44,14 +44,7 @@ class BaseLayerNorm(BaseLayer):
 
 
 class TPLayerNorm(BaseLayerNorm):
-
-    def collect_bind_layer_weights(self):
-        weight_key = '.'.join([self.context, 'weight'])
-        weight_np = self.get_param_from_state_dict(weight_key, [self.input_size])
-        self.weight_id = self.add_initialized_input_tensor(weight_np, weight_key)
-        bias_key = '.'.join([self.context, 'bias'])
-        bias_np = self.get_param_from_state_dict(bias_key, [self.input_size])
-        self.bias_id = self.add_initialized_input_tensor(bias_np, bias_key)
+    pass
 
 
 class LayerNorm(TPLayerNorm, BaseLayerNorm):

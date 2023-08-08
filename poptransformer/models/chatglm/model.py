@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import re
+import math
 import torch
 import numpy as np
 from transformers import AutoTokenizer, AutoConfig, AutoModel
@@ -22,6 +23,16 @@ from poptransformer.models import HFDec2stageBaseModel
 from poptransformer.models.chatglm.embedding import ChatGLMEmbedding
 from poptransformer.models.chatglm.attention import RotaryAttention
 from poptransformer.models.chatglm.lm_head import LMHead
+
+
+def vocab_size_calibration(vocab_size,
+                           num_embedding_splits=1,
+                           num_lmhead_splits=2):
+    r1 = math.ceil(vocab_size / num_embedding_splits)
+    r2 = math.ceil((r1 + 2) / num_lmhead_splits)
+    corrected_vocab_size = (r2 * num_lmhead_splits - 2) * num_embedding_splits
+    print(f"Vocab size adjust from {vocab_size} to {corrected_vocab_size}.")
+    return corrected_vocab_size
 
 
 class ChatGLMBlock(BaseLayer):
@@ -81,32 +92,29 @@ class ChatGLMBlock(BaseLayer):
         **kwargs,
     ):
         matmul_kwargs = {
-            "amp": 0.2 if sequence_length > 32 else 0.6,
-            "partialtype": "half" if sequence_length > 1 else "float"
+            "amp": 0.2,
+            "partialtype": "half" if sequence_length > 1 else "float",
         }
         with graph.nameScope(self.context):
-            attention_input = self.layer_norm1(graph, x, sequence_length, norm_type)
-            attention_output, layer_present = self.attention(
-                graph,
-                attention_input,
-                layer_past,
-                position_ids,
-                block_position_ids,
-                step,
-                attention_mask,
-                sequence_length,
-                softmax_type,
-                **matmul_kwargs
-            )
-            alpha = ops.constant(
-                graph,
-                np.array([(2.0 * self.num_layers) ** 0.5], dtype=np.float16),
-            )
-            temp_x = ops.add(
-                graph, ops.mul(graph, attention_input, alpha), attention_output
-            )
+            attention_input = self.layer_norm1(
+                graph, x, sequence_length, norm_type)
+            with self.option_scope(**matmul_kwargs):
+                attention_output, layer_present = self.attention(
+                    graph,
+                    attention_input,
+                    layer_past,
+                    position_ids,
+                    block_position_ids,
+                    step,
+                    attention_mask,
+                    sequence_length,
+                    softmax_type,
+                )
+            alpha = ops.constant(graph, np.array([(2.0 * self.num_layers) ** 0.5], dtype=self.np_float_type))
+            temp_x = ops.add(graph, ops.mul(graph, attention_input, alpha), attention_output)
             mlp_input = self.layer_norm2(graph, temp_x, sequence_length, norm_type)
-            mlp_output = self.mlp(graph, mlp_input, **matmul_kwargs)
+            with self.option_scope(**matmul_kwargs):
+                mlp_output = self.mlp(graph, mlp_input)
             output = ops.add(graph, ops.mul(graph, mlp_input, alpha), mlp_output)
         return output, layer_present
 
@@ -159,9 +167,7 @@ class Transformer(BaseLayer):
             )
             for layer_index in range(self.num_layers)
         ]
-        self.layer_norm = LayerNorm(
-            self.context, "final_layernorm", self.hidden_size, self.eps
-        )
+        self.layer_norm = LayerNorm(self.context, "final_layernorm", self.hidden_size, self.eps)
 
     def __call__(
         self,
@@ -181,49 +187,41 @@ class Transformer(BaseLayer):
         outline_blocks = kwargs.get("outline_blocks", "single_block")
         if outline_blocks:
             self.logger.info("outlining transformer blocks")
-            self.logger.info(
-                "please make sure disable outlining in session options is set to False"
-            )
-        hidden_states = self.embedding(graph, input_ids)
+            self.logger.info("please make sure disable outlining in session options is set to False")
+        with graph.virtualGraph(0):
+            hidden_states = self.embedding(graph, input_ids, sequence_length)
+            hidden_states = ops.replicated_all_reduce(graph, hidden_states)
         end_points = np.cumsum(self.layer_per_ipu)
         layer_present_list = []
         for i in range(self.num_layers):
             stage_offset = sum(i >= end_points)
-            with graph.virtualGraph(stage_offset):
-                if outline_blocks == "single_block":
-                    with graph.outlineAttributes({"block": "sub_" + str(i)}):
-                        hidden_states, present = self.blocks[i](
-                            graph,
-                            hidden_states,
-                            layer_past_list[i],
-                            position_ids,
-                            block_position_ids,
-                            sequence_length,
-                            step,
-                            attention_mask,
-                            norm_type,
-                            softmax_type,
-                        )
-                else:
-                    hidden_states, present = self.blocks[i](
-                        graph,
-                        hidden_states,
-                        layer_past_list[i],
-                        position_ids,
-                        block_position_ids,
-                        sequence_length,
-                        step,
-                        attention_mask,
-                        norm_type,
-                        softmax_type,
-                    )
-                self.logger.info(f"block {i} placed on IPU {stage_offset}")
-                layer_present_list.append(present)
+            if outline_blocks is None:
+                outline_attr = None
+            elif outline_blocks == 'single_block':
+                outline_attr = {'block': f'sub_{i}'}
+            elif outline_blocks == 'multi_block':
+                outline_attr = {'block': f'sub_{stage_offset}'}
+            else:
+                raise ValueError(
+                    f'invalid value {outline_blocks} for outline_blocks')
+            with self.device_scope(graph, stage_offset, stage_offset, outline_attr):
+                hidden_states, present = self.blocks[i](
+                    graph,
+                    hidden_states,
+                    layer_past_list[i],
+                    position_ids,
+                    block_position_ids,
+                    sequence_length,
+                    step,
+                    attention_mask,
+                    norm_type,
+                    softmax_type,
+                )
+            self.logger.info(f"block {i} placed on IPU {stage_offset}")
+            layer_present_list.append(present)
 
         with graph.virtualGraph(stage_offset):
-            hidden_states = self.layer_norm(
-                graph, hidden_states, sequence_length, norm_type
-            )
+            hidden_states = self.layer_norm(graph, hidden_states, sequence_length, norm_type)
             if return_last:
                 hidden_states = ops.static_slice(
                     graph, hidden_states, [sequence_length - 1], [sequence_length], [1]
@@ -234,9 +232,9 @@ class Transformer(BaseLayer):
 
 class ChatGLMDecModel(HFDec2stageBaseModel):
     def __init__(self, **kwargs):
+        self.num_embedding_partitions = kwargs.get("num_embedding_partitions", 4)
         super().__init__(**kwargs)
         self.outline_blocks = kwargs.get("outline_blocks", True)
-        self.num_embedding_partitions = kwargs.get("num_embedding_partitions", 4)
         self.transformer = Transformer(
             None,
             "transformer",
@@ -250,43 +248,47 @@ class ChatGLMDecModel(HFDec2stageBaseModel):
             self.hf_config.max_sequence_length,
             self.num_embedding_partitions,
         )
+        self.topk = 1
         self.lm_head = LMHead(
-            None,
-            "lm_head",
-            self.hf_config.vocab_size,
-            self.transformer.embedding.num_embedding_partitions,
-            self.transformer.embedding.token_offsets,
-            self.transformer.embedding.embedding_pad_mask,
+            context="",
+            name='lm_head',
+            vocab_size=self.hf_config.vocab_size,
+            topk=self.topk,
+            embedding_size=self.hf_config.hidden_size,
+            embedding_weights=self.transformer.embedding.weight_ids,
+            num_embedding_partitions=self.num_embedding_partitions,
+            token_offsets=self.transformer.embedding.token_offsets,
+            embedding_pad_mask=self.transformer.embedding.embedding_pad_mask,
         )
+        self.lm_head.set_virtual_id(0)
 
     def prepare_state_dict(self):
         hf_args = {
             "pretrained_model_name_or_path": self.hf_model_name,
             "trust_remote_code": True,
-            "revision": "v1.1.0",
+            "revision": "v1.1.0" if self.precision != "int4" else "v0.1.0",
             "cache_dir": self.hf_cache_dir,
         }
         self.hf_tokenizer = AutoTokenizer.from_pretrained(**hf_args)
-        self.logger.info(f"initialized tokenizer by model_name: {self.hf_model_name}")
+        self.logger.info(
+            f"initialized tokenizer by model_name: {self.hf_model_name}")
         self.hf_config = AutoConfig.from_pretrained(**hf_args)
-        # self.hf_config.num_layers = 4
+        if self.precision == "int4":
+            if self.model_type == "shard":
+                self.hf_config.vocab_size = vocab_size_calibration(
+                                                self.hf_config.vocab_size,
+                                                num_embedding_splits=self.num_embedding_partitions,
+                                                num_lmhead_splits=6)
+        self.hf_config.num_layers = sum(self.layer_per_ipu)
         self.logger.info(f"loading pretrained hf model: {self.hf_model_name}")
         self.hf_model = AutoModel.from_pretrained(**hf_args).half().eval()
         self.state_dict = self.hf_model.state_dict()
         tensor_names = list(self.state_dict.keys())
         for k in tensor_names:
-            v = self.state_dict[k]
-            if ".attention" in k or "mlp" in k:
-                if "weight" in k:
-                    self.state_dict[k] = v.permute(1, 0)
             if "dense_h_to_4h" in k:
-                self.state_dict[
-                    k.replace("dense_h_to_4h", "c_fc")
-                ] = self.state_dict.pop(k)
+                self.state_dict[k.replace("dense_h_to_4h", "c_fc")] = self.state_dict.pop(k)
             if "dense_4h_to_h" in k:
-                self.state_dict[
-                    k.replace("dense_4h_to_h", "c_proj")
-                ] = self.state_dict.pop(k)
+                self.state_dict[k.replace("dense_4h_to_h", "c_proj")] = self.state_dict.pop(k)
         self.register_state_dict()
 
     def build_model_graph_1st(
@@ -299,8 +301,7 @@ class ChatGLMDecModel(HFDec2stageBaseModel):
         sequence_length=1,
     ):
         model_graph = self.graph
-
-        with model_graph.virtualGraph(0):
+        with self.device_scope(model_graph, virtual_graph_id=0):
             input_ids = ops.static_slice(
                 model_graph,
                 input_ids_container,
@@ -325,12 +326,20 @@ class ChatGLMDecModel(HFDec2stageBaseModel):
             sequence_length=sequence_length,
             outline_blocks=self.outline_blocks,
         )
-        with model_graph.virtualGraph(0):
-            next_ids = self.lm_head(
-                model_graph, hidden_states, self.transformer.embedding.weight_ids
-            )
+        with self.device_scope(model_graph, virtual_graph_id=0):
+            matmul_kwargs = {
+                "amp": 0.2,
+                "partialtype": "half",
+            }
+            if self.precision=="int4" and self.model_type=="shard":
+                matmul_kwargs.update({
+                    "serial_factor": 6,
+                    "serial_mode": "output_channels"
+                })
+            with self.option_scope(**matmul_kwargs):
+                next_ids = self.lm_head(model_graph, hidden_states, 1)
 
-        with model_graph.virtualGraph(0):
+        with self.device_scope(model_graph, virtual_graph_id=0):
             next_input_ids = ops.constant(
                 model_graph,
                 np.ones((self.batch_size, 1), dtype=np.int32)
@@ -353,13 +362,7 @@ class ChatGLMDecModel(HFDec2stageBaseModel):
                 axes=[1],
                 sizes=[1],
             )
-
-        return (
-            next_iput_ids_container,
-            next_step,
-            position_ids,
-            layer_present_list,
-        )
+        return next_iput_ids_container, next_step, position_ids, layer_present_list
 
     def build_model_graph_2nd(
         self,
@@ -377,14 +380,14 @@ class ChatGLMDecModel(HFDec2stageBaseModel):
         self.add_input_tensor(model_graph, "BOOL", [], "cond_place_holder")
         self.add_input_tensor(model_graph, "INT32", [], "max_loop_place_holder")
         # add inputs for graph
-        input_ids_container = model_graph.addUntypedInputTensor(input_ids_container)
-        step = model_graph.addUntypedInputTensor(step)
-        attention_mask = model_graph.addUntypedInputTensor(attention_mask)
-        stop_mask = model_graph.addUntypedInputTensor(stop_mask)
-        position_ids = model_graph.addUntypedInputTensor(position_ids)
-        layer_past_list = [model_graph.addUntypedInputTensor(i) for i in layer_past_list]
+        input_ids_container = self.add_untyped_input_tensor(model_graph, input_ids_container)
+        step = self.add_untyped_input_tensor(model_graph, step)
+        attention_mask = self.add_untyped_input_tensor(model_graph, attention_mask)
+        stop_mask = self.add_untyped_input_tensor(model_graph, stop_mask)
+        position_ids = self.add_untyped_input_tensor(model_graph, position_ids)
+        layer_past_list = self.add_untyped_input_tensor(model_graph, layer_past_list)
 
-        with model_graph.virtualGraph(0):
+        with self.device_scope(model_graph, virtual_graph_id=0):
             input_ids = ops.dynamic_slice(
                 model_graph,
                 input_ids_container,
@@ -411,16 +414,22 @@ class ChatGLMDecModel(HFDec2stageBaseModel):
             sequence_length=sequence_length,
             outline_blocks=self.outline_blocks,
         )
-        with model_graph.virtualGraph(0):
-            next_ids = self.lm_head(
-                model_graph, hidden_states, self.transformer.embedding.weight_ids
-            )
+        with self.device_scope(model_graph, virtual_graph_id=0):
+            matmul_kwargs = {
+                "amp": 0.2,
+                "partialtype": "float",
+            }
+            if self.precision=="int4" and self.model_type=="shard":
+                matmul_kwargs.update({
+                    "serial_factor": 6,
+                    "serial_mode": "output_channels"
+                })
+            with self.option_scope(**matmul_kwargs):
+                next_ids = self.lm_head(model_graph, hidden_states, sequence_length)
 
-        with model_graph.virtualGraph(0):
+        with self.device_scope(model_graph, virtual_graph_id=0):
             next_input_ids = next_ids
-            step_add_value = ops.constant(
-                model_graph, np.array(1).astype(np.int32), "1"
-            )
+            step_add_value = ops.constant(model_graph, np.array(1).astype(np.int32), "1")
             next_step = ops.add(model_graph, step, step_add_value)
 
             next_iput_ids_container = ops.dynamic_update(
@@ -437,7 +446,6 @@ class ChatGLMDecModel(HFDec2stageBaseModel):
                 np.zeros((self.batch_size, 1, 1, 1), dtype=self.np_float_type),
                 "attention_mask_updater",
             )
-            # next_attention_mask = [0] + attention_mask_container[:-1]
             attention_mask = ops.static_slice(
                 model_graph, attention_mask, starts=[0], ends=[-1], axes=[3]
             )
@@ -486,20 +494,17 @@ class ChatGLMDecModel(HFDec2stageBaseModel):
         else:
             prompt = query
 
-        inputs = self.hf_tokenizer(
-            prompt, return_tensors="pt", max_length=self.input_length
-        )
+        inputs = self.hf_tokenizer(prompt, return_tensors="pt", max_length=self.input_length)
 
         input_ids = inputs["input_ids"][..., :-1]
         input_ids_container = torch.zeros(1, self.max_length).int()
         input_ids_container[:, : input_ids.size(1)] = input_ids[0]
         input_ids_container = input_ids_container.repeat(self.batch_size, 1)
-
         position_ids = inputs["position_ids"][:, 0, :-1]
         last_position_id = inputs["position_ids"][:, 0, -1]
         position_ids_container = torch.zeros(1, self.max_length).int()
         position_ids_container[:, : position_ids.size(1)] = position_ids[0]
-        position_ids_container[:, position_ids.size(1) :] = last_position_id
+        position_ids_container[:, position_ids.size(1):] = last_position_id
         position_ids_container = position_ids_container.repeat(self.batch_size, 1)
 
         attention_mask_container = torch.zeros(1, self.max_length).int()
@@ -534,11 +539,16 @@ class ChatGLMDecModel(HFDec2stageBaseModel):
             return response
 
         output, decode_step = (
-            anchor_arrays["Loop:0"][0].tolist(),
+            anchor_arrays["Loop:0"],
             anchor_arrays["Loop:1"],
         )
 
-        output = output[output.index(self.hf_config.bos_token_id) :]
+        if len(output.shape) == 3:  # [num_replicas, batch_size, max_length]
+            output, decode_step = output[0], decode_step[0]
+        # Fixme: only support 1 batch.
+        output = output.tolist()[0] # [max_length]
+        if self.hf_config.bos_token_id in output:
+            output = output[output.index(self.hf_config.bos_token_id):]
         if self.hf_config.eos_token_id in output:
             output = output[: output.index(self.hf_config.eos_token_id)]
         output = self.hf_tokenizer.decode(output)

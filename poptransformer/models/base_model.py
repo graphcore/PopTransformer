@@ -12,13 +12,14 @@
 # limitations under the License.
 
 from abc import abstractmethod
+from collections import OrderedDict
 from transformers import AutoTokenizer
 from transformers import AutoConfig
 from transformers import AutoModel
 from transformers import AutoModelForCausalLM
 import numpy as np
 import popart
-from poptransformer.utils import REGISTRY
+from poptransformer.utils import REGISTRY, DeviceScope, OptionsScope
 from poptransformer import ops
 
 
@@ -26,27 +27,48 @@ class BaseModel:
 
     graph = REGISTRY.get('main_graph')
     logger = REGISTRY.get('logger')
+    tensor_type = REGISTRY.get('tensor_type')
 
     def __init__(self, **kwargs):
         self.logger.info(f'Initializing model class: {self.__class__.__name__}')
-        self.batch_size = kwargs.get('batch_size', 1)
-        self.model_type = kwargs.get('model_type', 'shard')
-        self.num_replicas = kwargs.get('num_replicas', 1)
-        self.precision = kwargs.get('precision', 'fp16')
-        self.np_float_type = np.float32 if self.precision == 'fp32' else np.float16
-        self.popart_float_type = 'FLOAT' if self.precision == 'fp32' else 'FLOAT16'
         self.anchor_return_type = kwargs.get('anchor_return_type', 'ALL')
         self.layer_per_ipu = kwargs.get('layer_per_ipu', [])
-        REGISTRY.register('batch_size', self.batch_size)
-        REGISTRY.register('precision', self.precision)
-        REGISTRY.register('np_float_type', self.np_float_type)
-        REGISTRY.register('popart_float_type', self.popart_float_type)
-        REGISTRY.register('model_type', self.model_type)
-        REGISTRY.register('num_replicas', self.num_replicas)
+
+    @property
+    def enable_pipeline(self):
+        return REGISTRY.get('enable_pipeline')
+
+    @property
+    def batch_size(self):
+        return REGISTRY.get('batch_size')
+
+    @property
+    def batch_per_step(self):
+        return REGISTRY.get('batch_per_step')
+
+    @property
+    def model_type(self):
+        return REGISTRY.get('model_type')
+
+    @property
+    def num_replicas(self):
+        return REGISTRY.get('num_replicas')
 
     @property
     def stage_num(self):
         return max(len(self.layer_per_ipu), 1)
+
+    @property
+    def popart_float_type(self):
+        return REGISTRY.get('tensor_type').popart_float_type
+
+    @property
+    def np_float_type(self):
+        return REGISTRY.get('tensor_type').np_float_type
+
+    @property
+    def precision(self):
+        return REGISTRY.get('tensor_type').precision
 
     @abstractmethod
     def prepare_state_dict(self):
@@ -71,10 +93,16 @@ class BaseModel:
         # return a dict for layer usage
         pass
 
+    def device_scope(self, graph, virtual_graph_id=None, pipeline_stage_id=None, outline_attr=None):
+        return DeviceScope(graph, virtual_graph_id, pipeline_stage_id, self.enable_pipeline, outline_attr)
+
+    def option_scope(self, amp=None, partialtype=None, serial_factor=None, serial_mode=None):
+        return OptionsScope(amp, partialtype, serial_factor, serial_mode)
+
     def register_state_dict(self):
         # register the state dict to REGISTER, will be used in layer
         assert self.state_dict
-        REGISTRY.register('state_dict', self.state_dict)
+        REGISTRY.update('state_dict', self.state_dict)
 
     @property
     def initializers(self):
@@ -84,7 +112,7 @@ class BaseModel:
 
     @property
     def model_output(self):
-        output_tensor_ids = self.graph.getOutputTensorIds()
+        output_tensor_ids = self.get_output_tensor_ids(self.graph)
         anchor_return_type = popart.AnchorReturnType(self.anchor_return_type)
         return {key: anchor_return_type for key in output_tensor_ids}
 
@@ -104,13 +132,23 @@ class BaseModel:
         raise ValueError(f"Invalid model_type: {self.model_type}")
 
     def add_input_tensor_from_parent_graph(self, graph, tensor_id):
-        if isinstance(tensor_id, list):
-            for i in tensor_id:
-                graph.addInputTensorFromParentGraph(i)
-        elif isinstance(tensor_id, str):
+        if isinstance(tensor_id, str):
             graph.addInputTensorFromParentGraph(tensor_id)
+        elif isinstance(tensor_id, list):
+            for i in tensor_id:
+                self.add_input_tensor_from_parent_graph(graph, i)
         else:
             raise ValueError(f"Invalid tensor_id: {tensor_id}")
+
+    def add_untyped_input_tensor(self, graph, tensor_id):
+        if isinstance(tensor_id, list):
+            all_tensor_ids = []
+            for i in tensor_id:
+                all_tensor_ids.append(graph.addUntypedInputTensor(i))
+            return all_tensor_ids
+        if isinstance(tensor_id, str):
+            return graph.addUntypedInputTensor(tensor_id)
+        raise ValueError(f"Invalid tensor_id: {tensor_id}")
 
     def add_output_tensor(self, graph, output):
         if isinstance(output, list):
@@ -120,6 +158,22 @@ class BaseModel:
             graph.addOutputTensor(output)
         else:
             raise ValueError(f"Invalid output: {output}")
+
+    def get_input_tensor_ids(self, graph):
+        return [tensor_id for tensor_id in graph.getInputTensorIds()
+                if not graph.isInitializer(tensor_id)]
+
+    def get_output_tensor_ids(self, graph):
+        return graph.getOutputTensorIds()
+
+    def create_sub_graph(self, graph, name, sub_graph_inputs, is_loop_graph=False):
+        sub_graph = graph.createSubgraphBuilder()
+        sub_graph.setGraphName(name)
+        if is_loop_graph:
+            self.add_input_tensor(sub_graph, 'INT32', [], 'max_loop')
+            self.add_input_tensor(sub_graph, 'BOOL', [], 'cond')
+        self.add_input_tensor_from_parent_graph(sub_graph, sub_graph_inputs)
+        return sub_graph
 
 
 class HFBaseModel(BaseModel):
@@ -158,7 +212,7 @@ class HFBaseModel(BaseModel):
             self.logger.info(f'loading pretrained hf model: {self.hf_model_name}')
             self.hf_config = self.hf_model.config
             self.process_hf_model_state_dict()
-            if self.precision == 'fp16':
+            if self.precision != 'fp32':
                 self.hf_model.half()
                 self.logger.info(f'casting model to {self.precision}')
             self.state_dict = self.hf_model.state_dict()
@@ -179,59 +233,101 @@ class HFDecBaseModel(HFBaseModel):
         self.max_loop = max_loop if max_loop else self.max_length
 
     @abstractmethod
-    def build_model_graph(
-        self,
-        input_ids_container,
-        step,
-        attention_mask,
-        stop_mask,
-        sequence_length,
-    ):
+    def build_model_graph(self, model_graph, model_graph_inputs, sequence_length=1):
+        # TODO: Add params docstring.
         # return model graph
         pass
 
-    def build_attention_mask(self, graph):
-        attention_mask_value = [[0] + [-10000 for i in range(self.max_length - 1)]] * self.batch_size
-        attention_mask_value = np.array(attention_mask_value).astype(self.np_float_type)
-        attention_mask = ops.constant(
-            graph, attention_mask_value, 'attention_mask')
-        return attention_mask
+    def build_default_inputs(self):
+        # build input tensor here, no need to feed to step io if not used.
+        default_inputs = OrderedDict()
+        default_inputs['input_ids_container'] = self.add_input_tensor(
+            self.graph, 'INT32', [self.batch_size, self.max_length], 'input_ids')
+        default_inputs['step'] = self.add_input_tensor(
+            self.graph, 'INT32', [], 'step')
+        default_inputs['attention_mask'] = self.add_input_tensor(
+            self.graph, 'INT32', [self.batch_size, self.max_length], 'attention_mask')
+        default_inputs['position_ids'] = self.add_input_tensor(
+            self.graph, 'INT32', [self.batch_size, self.max_length], 'position_ids')
+        default_inputs['stop_mask'] = self.add_input_tensor(
+            self.graph, 'INT32', [], 'stop_mask')
+        return default_inputs
+
+    def build_model_graph_inputs(self, graph, inputs):
+        with graph.nameScope('mask'):
+            attention_mask_value = [[0] + [-10000 for i in range(self.max_length - 1)]] * self.batch_size
+            attention_mask_value = np.array(attention_mask_value).astype(self.np_float_type)
+            attention_mask = ops.constant(
+                graph, attention_mask_value, 'attention_mask')
+            inputs['attention_mask'] = attention_mask
+        with graph.nameScope('step'):
+            inputs['step'] = ops.constant(self.graph, np.array(0).astype(np.int32), 'init_step')
+        with graph.nameScope('stop_mask'):
+            inputs['stop_mask'] = ops.constant(
+                self.graph, np.zeros((self.batch_size,)).astype(np.int32), 'stop_mask')
+        del inputs['position_ids']
+        return inputs
 
     def build_graph(self):
-        input_ids_container = self.add_input_tensor(
-            self.graph, 'INT32', [self.batch_size, self.max_length], 'input_ids'
-        )
-        attention_mask = self.build_attention_mask(self.graph)
-        step = ops.constant(self.graph, np.array(0).astype(np.int32), 'init_step')
-        stop_mask = ops.constant(
-            self.graph, np.zeros((self.batch_size,)).astype(np.int32), 'stop_mask'
-        )
-        model_graph = self.build_model_graph(
-            input_ids_container, step, attention_mask, stop_mask, sequence_length=1)
-
-        loop_graph_input_list = [input_ids_container, step, attention_mask, stop_mask]
-
+        default_inputs = self.build_default_inputs()
         with self.graph.virtualGraph(0):
-            output_id, step = ops.loop(
+            model_graph_inputs = self.build_model_graph_inputs(self.graph, default_inputs)
+        model_graph = self.create_sub_graph(
+            self.graph,
+            'model_graph',
+            list(model_graph_inputs.values()),
+            True
+        )
+        model_outputs = self.build_model_graph(model_graph, model_graph_inputs, sequence_length=1)
+        self.build_post_model_graph(model_graph, model_graph_inputs, model_outputs)
+        with self.device_scope(self.graph, 0):
+            outputs = ops.loop(
                 self.graph,
                 self.max_loop,
-                loop_graph_input_list,
+                list(model_graph_inputs.values()),
                 model_graph
             )[:2]
-        self.add_output_tensor(self.graph, [output_id, step])
+        self.add_output_tensor(self.graph, outputs)
+
+
+    def build_post_model_graph(self, model_graph, model_graph_inputs, model_outputs):
+        # continue build model graph for post inference step
+        stage_offset = model_outputs['stage_offset']
+        next_ids = model_outputs['next_ids']
+        attention_mask = model_graph_inputs['attention_mask']
+        step = model_graph_inputs['step']
+        input_ids_container = model_graph_inputs['input_ids_container']
+        stop_mask = model_graph_inputs['stop_mask']
+
+        with self.device_scope(model_graph, 0, pipeline_stage_id=stage_offset):
+            next_iput_ids_container, next_step, next_attention_mask, id_to_update= self.step_containers(
+                model_graph, input_ids_container, step, attention_mask, next_ids
+            )
+            next_stop_mask, keep_going_cond = self.step_loop_cond(model_graph, id_to_update, stop_mask)
+
+        self.add_output_tensor(
+            model_graph,
+            [keep_going_cond, next_iput_ids_container, next_step, next_attention_mask, next_stop_mask])
+        # build model graph for post inference step
 
     def step_containers(self, graph, input_ids_container, step, attention_mask, next_ids):
-        # TODO: Unify the order of inputs/outputs
         with graph.nameScope('step_containers'):
+            if self.hf_tokenizer.pad_token_id:
+                pad_token_id = self.hf_tokenizer.pad_token_id
+            else:
+                pad_token_id = self.hf_config.pad_token_id
             step_add_value = ops.constant(graph, np.array(1).astype(np.int32), '1')
             next_step = ops.add(graph, step, step_add_value)
-            attention_mask_add = ops.constant(
-                graph, np.zeros((self.batch_size, 1), dtype=self.np_float_type), 'attention_mask_add')
-            next_attention_mask = ops.dynamic_update(
-                graph, attention_mask, next_step, attention_mask_add, axes=[1], sizes=[1])
+            if attention_mask is not None:
+                attention_mask_add = ops.constant(
+                    graph, np.zeros((self.batch_size, 1), dtype=self.np_float_type), 'attention_mask_add')
+                next_attention_mask = ops.dynamic_update(
+                    graph, attention_mask, next_step, attention_mask_add, axes=[1], sizes=[1])
+            else:
+                next_attention_mask = None
             input_ids_slice = ops.dynamic_slice(
                 graph, input_ids_container, next_step, axes=[1], sizes=[1])
-            pad_id = ops.constant(graph, np.array(self.hf_tokenizer.pad_token_id), 'pad_id')
+            pad_id = ops.constant(graph, np.array(pad_token_id), 'pad_id')
             id_update_cond = ops.equal(graph, input_ids_slice, pad_id)
             id_to_update = ops.where(graph, id_update_cond, next_ids, input_ids_slice)
             next_iput_ids_container = ops.dynamic_update(
@@ -240,8 +336,12 @@ class HFDecBaseModel(HFBaseModel):
 
     def step_loop_cond(self, graph, id_to_update, stop_mask):
         with graph.nameScope('step_loop_cond'):
+            if self.hf_tokenizer.eos_token_id:
+                eos_token_id = self.hf_tokenizer.eos_token_id
+            else:
+                eos_token_id = self.hf_config.eos_token_id
             temp_id_to_update = ops.squeeze(graph, id_to_update, [1])
-            eos_id = ops.constant(graph, np.array(self.hf_tokenizer.eos_token_id), 'eos_id')
+            eos_id = ops.constant(graph, np.array(eos_token_id), 'eos_id')
             current_stop_mask = ops.equal(graph, temp_id_to_update, eos_id)
             current_stop_mask = ops.cast(graph, current_stop_mask, 'INT32')
             next_stop_mask = ops.bitwiseor(graph, stop_mask, current_stop_mask)
@@ -307,14 +407,14 @@ class HFDec2stageBaseModel(HFDecBaseModel):
         cache_shape = (
             2,
             self.batch_size,
-            self.hf_config.num_attention_heads,
+            self.hf_config.num_attention_heads // self.num_replicas,
             self.max_length,
             self.hf_config.hidden_size // self.hf_config.num_attention_heads,
         )
         init_past_list = [
             ops.constant(
                 self.graph,
-                np.zeros(cache_shape).astype(np.float16),
+                np.zeros(cache_shape).astype(self.np_float_type),
                 f"init_past_{str(i)}",
             )
             for i in range(self.hf_config.num_layers)
@@ -380,8 +480,7 @@ class HFDec2stageBaseModel(HFDecBaseModel):
             layer_present_list,
             1
         )
-
-        with self.graph.virtualGraph(0):
+        with self.device_scope(self.graph, 0, 0):
             output_id, step = ops.loop(
                 self.graph,
                 self.max_loop,

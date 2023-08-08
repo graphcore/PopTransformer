@@ -92,33 +92,32 @@ class Transformer(BaseLayer):
         if outline_blocks:
             self.logger.info('outlining transformer blocks')
             self.logger.info('please make sure disable outlining in session options is set to False')
-        with graph.virtualGraph(0):
+        with self.device_scope(graph, 0, 0):
             hidden_states = self.embedding(graph, input_ids, position_ids, sequence_length)
 
         end_points = np.cumsum(self.layer_per_ipu)
-
         for i in range(self.n_layer):
             stage_offset = sum(i >= end_points)
-            with graph.virtualGraph(stage_offset):
-                if outline_blocks == 'single_block':
-                    with graph.outlineAttributes({'block': 'sub_' + str(i)}):
-                        hidden_states = self.blocks[i](
-                            graph, hidden_states, sequence_length, step, attention_mask, norm_type, softmax_type)
-                elif outline_blocks == 'multi_block':
-                    with graph.outlineAttributes({'block': 'sub_' + str(stage_offset)}):
-                        hidden_states = self.blocks[i](
-                            graph, hidden_states, sequence_length, step, attention_mask, norm_type, softmax_type)
-                else:
-                    hidden_states = self.blocks[i](
-                        graph, hidden_states, sequence_length, step, attention_mask, norm_type, softmax_type)
+            if outline_blocks is None:
+                outline_attr = None
+            elif outline_blocks == 'single_block':
+                outline_attr = {'block': f'sub_{i}'}
+            elif outline_blocks == 'multi_block':
+                outline_attr = {'block': f'sub_{stage_offset}'}
+            else:
+                raise ValueError(f'invalid value {outline_blocks} for outline_blocks')
+            with self.device_scope(graph, stage_offset, stage_offset, outline_attr):
+                hidden_states = self.blocks[i](
+                    graph, hidden_states, sequence_length, step, attention_mask, norm_type, softmax_type)
                 self.logger.info(f'block {i} placed on IPU {stage_offset}')
 
-        with graph.virtualGraph(stage_offset):
+        with self.device_scope(graph, stage_offset, stage_offset):
             if return_last:
                 hidden_states = ops.static_slice(graph, hidden_states, [0], [1], [1])
             last_sequence_length = 1 if return_last else sequence_length
             hidden_states = self.layer_norm(graph, hidden_states, last_sequence_length, norm_type)
-        return hidden_states
+
+        return hidden_states, stage_offset
 
 
 class GPT2DecModel(HFDecBaseModel):
@@ -142,7 +141,15 @@ class GPT2DecModel(HFDecBaseModel):
             self.layer_per_ipu,
             self.hf_config.n_positions,
         )
-        self.lm_head = LMHead(None, 'lm_head', self.topk)
+        self.lm_head = LMHead(
+            context=None,
+            name='lm_head',
+            topk=self.topk,
+            vocab_size=self.hf_config.vocab_size,
+            embedding_size=self.hf_config.n_embd,
+            tie_weight=self.transformer.embedding.wte.weight_id
+        )
+        self.lm_head.set_virtual_id(0)
 
     def process_hf_model_state_dict(self):
         with torch.no_grad():
@@ -152,21 +159,20 @@ class GPT2DecModel(HFDecBaseModel):
             for block in self.hf_model.transformer.h:
                 block.attn.c_attn.weight[:, :n_embd] = block.attn.c_attn.weight[:, :n_embd] * scale_value
                 block.attn.c_attn.bias[: n_embd] = block.attn.c_attn.bias[:n_embd] * scale_value
+                block.attn.c_attn.weight.transpose_(0, 1)
+                block.attn.c_proj.weight.transpose_(0, 1)
+                block.mlp.c_fc.weight.transpose_(0, 1)
+                block.mlp.c_proj.weight.transpose_(0, 1)
         self.logger.info('prescale applied')
 
-    def build_model_graph(self, input_ids_container, step, attention_mask, stop_mask, sequence_length=1):
-        model_graph = self.graph.createSubgraphBuilder()
-        model_graph.setGraphName('model_graph')
-        # add inputs for loop op
-        self.add_input_tensor(model_graph, 'BOOL', [], 'cond_place_holder')
-        self.add_input_tensor(model_graph, 'INT32', [], 'max_loop_place_holder')
-        # add inputs for looping graph
-        self.add_input_tensor_from_parent_graph(
-            model_graph, [input_ids_container, step, attention_mask, stop_mask])
-
-        with model_graph.virtualGraph(0):
+    def build_model_graph(self, model_graph, model_graph_inputs, sequence_length=1):
+        input_ids_container = model_graph_inputs['input_ids_container']
+        attention_mask = model_graph_inputs['attention_mask']
+        step = model_graph_inputs['step']
+        with self.device_scope(model_graph, 0, 0):
             input_ids = ops.dynamic_slice(model_graph, input_ids_container, step, axes=[1], sizes=[sequence_length])
             temp_attention_mask = ops.unsqueeze(model_graph, attention_mask, [1, 2])
+
             if sequence_length != 1:
                 position_ids_value = np.array([np.arange(self.max_length)] * self.batch_size)
                 position_ids_container = ops.constant(
@@ -175,7 +181,7 @@ class GPT2DecModel(HFDecBaseModel):
             else:
                 position_ids = ops.unsqueeze(model_graph, step, [0])
 
-        logits = self.transformer(
+        logits, stage_offset = self.transformer(
             model_graph,
             input_ids,
             position_ids,
@@ -184,32 +190,24 @@ class GPT2DecModel(HFDecBaseModel):
             sequence_length=sequence_length,
             outline_blocks=self.outline_blocks
         )
-        with model_graph.virtualGraph(0):
+
+        with self.device_scope(model_graph, pipeline_stage_id=stage_offset):
             next_ids = self.lm_head(
                 model_graph,
                 logits,
-                self.transformer.embedding.wte.weight_id,
-                self.transformer.embedding.wte.index_offset,
                 sequence_length=sequence_length
             )
-        with model_graph.virtualGraph(0):
-            next_iput_ids_container, next_step, next_attention_mask, id_to_update= self.step_containers(
-                model_graph, input_ids_container, step, attention_mask, next_ids
-            )
-            next_stop_mask, keep_going_cond = self.step_loop_cond(model_graph, id_to_update, stop_mask)
-
-        self.add_output_tensor(
-            model_graph,
-            [keep_going_cond, next_iput_ids_container, next_step, next_attention_mask, next_stop_mask])
-        return model_graph
+        model_outputs =  {'next_ids': next_ids, 'stage_offset': stage_offset}
+        return model_outputs
 
     def build_input_dict(self, **kwargs):
         input_string_list = list(kwargs.get('input_string_list', []))
-        if len(input_string_list) >= self.batch_size:
-            input_string_list = input_string_list[:self.batch_size]
+        batch_size = self.batch_size * self.batch_per_step
+        if len(input_string_list) >= batch_size:
+            input_string_list = input_string_list[:batch_size]
             self.logger.info('num input strings is larger than batch size, truncating')
         else:
-            input_string_list.extend([''] * (self.batch_size - len(input_string_list)))
+            input_string_list.extend([''] * (batch_size - len(input_string_list)))
             self.logger.info('num input string is smaller than batch size, adding fake inputs')
 
         inputs = self.hf_tokenizer(
